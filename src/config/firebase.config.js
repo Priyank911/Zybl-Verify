@@ -1,12 +1,11 @@
 // Firebase configuration
 export const firebaseConfig = {
-  projectId: "zybl-71200",
-  authDomain: "zybl-71200.firebaseapp.com",
-  storageBucket: "zybl-71200.appspot.com",
-  // Add your web app configuration values here
-  apiKey: "AIzaSyDqTvWZKtmgDMsRs6PUuhwdciHlg_JOQDU", // Get this from Firebase Console -> Project Settings -> Web App
-  messagingSenderId: "303661961096", // Get this from Firebase Console -> Project Settings -> Web App
-  appId: "1:303661961096:web:67aa3d9d3b0cf03d4df43d" // Get this from Firebase Console -> Project Settings -> Web App
+ apiKey: "AIzaSyAm1ouhHApJoejO8l6mSZUG_mknO7UFXnQ",
+  authDomain: "zybl-verify.firebaseapp.com",
+  projectId: "zybl-verify",
+  storageBucket: "zybl-verify.firebasestorage.app",
+  messagingSenderId: "696635779027",
+  appId: "1:696635779027:web:6bb071dd1154d0645af126"
 };
 
 // Encryption key for face vector encryption

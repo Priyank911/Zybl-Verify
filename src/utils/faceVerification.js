@@ -272,6 +272,30 @@ export const checkExistingFaceVector = async (faceVector) => {
   }
 };
 
+// Function to check if database is accessible
+export const checkDatabaseAccess = async () => {
+  try {
+    console.log('Checking database access...');
+    const faceVectorsRef = collection(db, 'faceVectors');
+    
+    // Try to get just one document to verify connectivity
+    const q = query(faceVectorsRef, where('test', '==', 'test'));
+    const querySnapshot = await getDocs(q);
+    
+    console.log('Database access check succeeded');
+    return true;
+  } catch (error) {
+    // If there's a permission error, the database is accessible but we don't have permission
+    if (error.code && (error.code === 'permission-denied' || error.code === 'resource-exhausted')) {
+      console.log('Database is accessible (permission error indicates DB exists)');
+      return true;
+    }
+    
+    console.error('Database access check failed:', error);
+    return false;
+  }
+};
+
 // Helper function for testing - clears verification state
 export const resetVerificationState = async () => {
   try {
