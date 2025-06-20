@@ -76,10 +76,17 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
 
   // Handle video stream
   const startVideo = () => {
+    // Detect if on mobile (portrait)
+    const isMobile = window.innerWidth <= 600;
+    const mobileDimensions = { width: 360, height: 480 };
+    const desktopDimensions = { width: 720, height: 560 };
+    const chosenDimensions = isMobile ? mobileDimensions : desktopDimensions;
+    setVideoDimensions(chosenDimensions);
     navigator.mediaDevices.getUserMedia({ 
       video: { 
-        width: { ideal: videoDimensions.width },
-        height: { ideal: videoDimensions.height }
+        width: { ideal: chosenDimensions.width },
+        height: { ideal: chosenDimensions.height },
+        facingMode: 'user'
       } 
     })
       .then(stream => {
