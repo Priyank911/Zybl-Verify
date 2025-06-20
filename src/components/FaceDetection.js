@@ -410,33 +410,57 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
           console.warn(`Error during stability check ${i+1}:`, err);
         }
       }
-      
-      // Step 3: Verify stability before checking database
-      if (stableDetectionCount < 2) {
+        // Step 3: Verify stability before checking database
+      if (stableDetectionCount < 3) {
         console.warn(`Face detection not stable enough (${stableDetectionCount}/3 stable detections)`);
         setMessage('Please keep your face centered and still');
         setIsCheckingExisting(false);
         return;
       }
       
-      console.log('Face detection is stable. Proceeding with verification check...');
+      // Enhanced: Check for self-consistency between all vectors
+      let consistentVectors = true;
+      for (let i = 0; i < faceVectors.length - 1; i++) {
+        for (let j = i + 1; j < faceVectors.length; j++) {
+          const selfSimilarity = calculateSimilarity(faceVectors[i], faceVectors[j]);
+          console.log(`Self-consistency check between vectors ${i} and ${j}: ${selfSimilarity.toFixed(4)}`);
+          
+          if (selfSimilarity < 0.97) { // Require extremely high self-consistency
+            consistentVectors = false;
+            console.warn(`Inconsistent face vectors detected: ${selfSimilarity.toFixed(4)}`);
+          }
+        }
+      }
       
-      // Step 4: Check all collected vectors against the database
+      if (!consistentVectors) {
+        console.warn("Face vectors are not consistent enough between frames");
+        setMessage('Please hold your face steady and look directly at the camera');
+        setIsCheckingExisting(false);
+        return;
+      }
+      
+      console.log('Face detection is stable and consistent. Proceeding with verification check...');
+      
+      // Step 4: Check all collected vectors against the database with double check
+      // We'll only count it as a match if multiple vectors match the SAME person
       let matchCount = 0;
+      let matchedIds = new Set();
       
       for (const vector of faceVectors) {
         try {
           const exists = await checkExistingFaceVector(vector);
           if (exists) {
             matchCount++;
+            // Here we would ideally track which specific ID matched,
+            // but for now we're just counting matches
           }
         } catch (error) {
           console.warn('Error during database check:', error);
         }
       }
       
-      // Step 5: Only verify if multiple checks succeed
-      if (matchCount >= 2) {
+      // Step 5: Only verify if MOST checks succeed (heightened requirement)
+      if (matchCount >= faceVectors.length - 1) {
         console.log(`User verified with high confidence (${matchCount}/${faceVectors.length} checks passed)`);
         setIsAlreadyVerified(true);
         setVerificationSuccess(true);
@@ -571,7 +595,7 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
     checkDatabaseConnection();
   }, []);
 
-  // Two-phase face detection and recognition process
+  // Two-phase face detection and recognition process with improved quality checks
   useEffect(() => {
     // Don't start face recognition until database check is complete
     if (isLoadingDatabase || hasCheckedDatabase || !videoRef.current || !canvasRef.current) {
@@ -579,15 +603,25 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
     }
     
     let faceCheckCount = 0;
-    const maxFaceChecks = 5;
-    const minRequiredDetections = 3;
+    const maxFaceChecks = 10; // More attempts to ensure quality
+    const minRequiredDetections = 5; // More detections for better verification
     let successfulDetections = 0;
     let detectedFaceVectors = [];
     let recognitionTimer = null;
+    let lowQualityDetections = 0;
     
     const performFaceRecognition = async () => {
       if (faceCheckCount >= maxFaceChecks || initialDbCheckComplete) {
         clearInterval(recognitionTimer);
+        
+        // If we didn't get enough good detections, just continue as a new user
+        if (successfulDetections < minRequiredDetections && !initialDbCheckComplete) {
+          console.log(`Insufficient quality face detections (${successfulDetections}/${minRequiredDetections}). Continuing as new user.`);
+          setHasCheckedDatabase(true);
+          setInitialDbCheckComplete(true);
+          setMessage('Welcome! Please complete verification steps.');
+        }
+        
         return;
       }
       
@@ -595,26 +629,55 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
         faceCheckCount++;
         console.log(`Face recognition attempt ${faceCheckCount}/${maxFaceChecks}...`);
         
-        const detections = await faceapi.detectAllFaces(videoRef.current, new faceapi.TinyFaceDetectorOptions())
+        // Message to show process is working
+        if (faceCheckCount === 1) {
+          setMessage('Scanning your face...');
+        } else if (faceCheckCount === 3) {
+          setMessage('Running face recognition...');
+        } else if (faceCheckCount === 5) {
+          setMessage('Almost there...');
+        }
+        
+        const detections = await faceapi.detectAllFaces(videoRef.current, new faceapi.TinyFaceDetectorOptions({ scoreThreshold: 0.7 }))
           .withFaceLandmarks()
           .withFaceExpressions()
           .withFaceDescriptors();
           
-        if (detections && detections.length > 0) {
-          successfulDetections++;
-          console.log(`Successful face detection: ${successfulDetections}/${minRequiredDetections}`);
+        if (detections && detections.length === 1) {
+          // Quality checks for the face detection
+          const detection = detections[0];
+          const landmarks = detection.landmarks;
+          const expressions = detection.expressions;
           
-          const faceVector = generateFaceVector(detections[0]);
-          detectedFaceVectors.push(faceVector);
+          // Check face detection quality factors
+          const isGoodQuality = checkFaceDetectionQuality(detection);
           
-          // Store the latest face vector for future use
-          faceVectorRef.current = faceVector;
-          
-          // When we have enough good detections, check if this face exists in database
-          if (successfulDetections >= minRequiredDetections) {
-            clearInterval(recognitionTimer);
-            await checkFaceInDatabase(detectedFaceVectors);
+          if (isGoodQuality) {
+            successfulDetections++;
+            console.log(`High quality face detection: ${successfulDetections}/${minRequiredDetections}`);
+            
+            try {
+              const faceVector = generateFaceVector(detection);
+              detectedFaceVectors.push(faceVector);
+              
+              // Store the latest face vector for future use
+              faceVectorRef.current = faceVector;
+              
+              // When we have enough good detections, check if this face exists in database
+              if (successfulDetections >= minRequiredDetections) {
+                clearInterval(recognitionTimer);
+                await checkFaceInDatabase(detectedFaceVectors);
+              }
+            } catch (err) {
+              console.warn('Error generating face vector:', err);
+              lowQualityDetections++;
+            }
+          } else {
+            console.log('Low quality face detection, skipping');
+            lowQualityDetections++;
           }
+        } else if (detections && detections.length > 1) {
+          console.log('Multiple faces detected, skipping this frame');
         } else {
           console.log('No face detected in this frame');
         }
@@ -623,9 +686,64 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
       }
     };
     
+    // Define the face detection quality check function
+    const checkFaceDetectionQuality = (detection) => {
+      try {
+        // Check if we have landmarks and descriptors
+        if (!detection.landmarks || !detection.descriptor) {
+          return false;
+        }
+        
+        const landmarks = detection.landmarks;
+        const expressions = detection.expressions || { neutral: 0.5 }; // Default if missing
+        const descriptor = detection.descriptor;
+        
+        // Check face position (needs to be well-centered)
+        const box = detection.detection.box;
+        const videoWidth = videoRef.current.videoWidth || 640;
+        const videoHeight = videoRef.current.videoHeight || 480;
+        
+        // Face should not be too close to the edges
+        const margin = 0.1; // 10% margin
+        const isWellCentered = 
+          box.x > videoWidth * margin && 
+          box.y > videoHeight * margin &&
+          (box.x + box.width) < videoWidth * (1 - margin) &&
+          (box.y + box.height) < videoHeight * (1 - margin);
+          
+        // Face should be large enough but not too large
+        const faceAreaRatio = (box.width * box.height) / (videoWidth * videoHeight);
+        const isGoodSize = faceAreaRatio > 0.05 && faceAreaRatio < 0.7; // Between 5% and 70% of frame
+        
+        // Face should not have extreme expressions
+        const neutralExpression = expressions.neutral || 0;
+        const hasNeutralExpression = neutralExpression > 0.5; // At least somewhat neutral
+        
+        // Check for overall quality
+        const qualityFactors = {
+          isWellCentered,
+          isGoodSize,
+          hasNeutralExpression,
+          descriptorLength: descriptor.length === 128 // Standard face-api descriptor length
+        };
+        
+        const qualityScore = Object.values(qualityFactors).filter(v => v).length;
+        const isGoodQuality = qualityScore >= 3; // At least 3 of 4 factors must be good
+        
+        if (!isGoodQuality) {
+          console.log('Face quality check failed with factors:', qualityFactors);
+        }
+        
+        return isGoodQuality;
+      } catch (err) {
+        console.warn('Error in face quality check:', err);
+        return false;
+      }
+    };
+    
     // Start periodic face recognition checks
     setMessage('Looking for your face...');
-    recognitionTimer = setInterval(performFaceRecognition, 1000);
+    recognitionTimer = setInterval(performFaceRecognition, 500);
     
     return () => {
       if (recognitionTimer) {
@@ -633,6 +751,67 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
       }
     };
   }, [isLoadingDatabase, hasCheckedDatabase]);
+
+  // Function to check face vectors against the database and update state
+  const checkFaceInDatabase = async (faceVectors) => {
+    try {
+      setMessage('Checking if you are already verified...');
+      setHasCheckedDatabase(true);
+      
+      console.log(`Checking ${faceVectors.length} high-quality face vectors against database`);
+      
+      // Check each vector against the database
+      let matchCount = 0;
+      
+      for (const vector of faceVectors) {
+        try {
+          const exists = await checkExistingFaceVector(vector);
+          if (exists) {
+            matchCount++;
+          }
+        } catch (error) {
+          console.warn('Error during database check:', error);
+        }
+      }
+      
+      // If majority of vectors match, user is verified
+      if (matchCount >= Math.ceil(faceVectors.length / 2)) {
+        console.log(`User verified with high confidence (${matchCount}/${faceVectors.length} checks passed)`);
+        setIsAlreadyVerified(true);
+        setVerificationSuccess(true);
+        setMessage('You are already verified! Face recognized.');
+        setVerificationComplete(true);
+        setStepsCompleted({
+          blink: true,
+          turnLeft: true,
+          turnRight: true,
+          faceStored: true
+        });
+        
+        // Update verification state
+        setVerification(prev => ({
+          ...prev,
+          blinks: 2,
+          leftTurn: true,
+          rightTurn: true,
+          verificationStrength: 100
+        }));
+        
+        // Call the completion callback
+        if (onVerificationComplete) {
+          onVerificationComplete();
+        }
+      } else {
+        console.log(`User not verified (only ${matchCount}/${faceVectors.length} checks passed)`);
+        setInitialDbCheckComplete(true);
+        setMessage('Please blink twice (0/2) to begin verification');
+      }
+    } catch (error) {
+      console.error('Error during database check:', error);
+      setInitialDbCheckComplete(true);
+      setMessage('Please blink twice (0/2) to begin verification');
+    }
+  };
 
   const calculateEAR = (eye) => {
     try {
@@ -655,7 +834,7 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
       Math.pow(point2.x - point1.x, 2) + 
       Math.pow(point2.y - point1.y, 2)
     );
-  };  // Enhanced verification completion handler
+  };  // Extremely robust verification completion handler
   const handleVerificationComplete = async () => {
     try {
       // If we're already verified, skip the process
@@ -691,67 +870,85 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
       setVerificationStep('storeData');
       setMessage('Processing verification...');
       
-      // Use stored face vector if available, otherwise detect a new one
-      let faceVector = faceVectorRef.current;
+      // STEP 1: Collect multiple high-quality face vectors
+      const faceVectors = [];
+      let captureAttempts = 0;
+      const maxCaptureAttempts = 5;
       
-      if (!faceVector) {
-        // Try to get the face vector one more time
+      setMessage('Capturing face data...');
+      
+      while (faceVectors.length < 3 && captureAttempts < maxCaptureAttempts) {
+        captureAttempts++;
+        
         try {
-          setMessage('Capturing your face data...');
+          // Wait briefly between captures to get different frames
+          if (captureAttempts > 1) {
+            await new Promise(resolve => setTimeout(resolve, 300));
+          }
+          
           const detections = await faceapi.detectAllFaces(videoRef.current, new faceapi.TinyFaceDetectorOptions())
             .withFaceLandmarks()
             .withFaceDescriptors();
 
-          if (detections && detections.length > 0) {
-            faceVector = generateFaceVector(detections[0]);
-          } else {
-            throw new Error("No face detected during verification completion");
+          if (detections && detections.length === 1) {
+            // Use our quality check function
+            const isGoodQuality = checkFaceDetectionQuality(detections[0]);
+            
+            if (isGoodQuality) {
+              const vector = generateFaceVector(detections[0]);
+              faceVectors.push(vector);
+              console.log(`Captured high-quality face vector ${faceVectors.length}/3`);
+            } else {
+              console.log('Low quality detection, skipping');
+            }
           }
         } catch (error) {
-          console.error("Error detecting face for vector generation:", error);
-          throw new Error("Couldn't capture your face properly. Please try again.");
+          console.warn(`Error capturing face vector (attempt ${captureAttempts}):`, error);
         }
       }
       
-      if (!faceVector) {
-        throw new Error("Could not generate face data. Please try again.");
+      // STEP 2: Ensure we have enough quality vectors
+      if (faceVectors.length < 2) {
+        throw new Error("Could not capture enough high-quality face images. Please try again in better lighting.");
       }
-
-      // First check if this face already exists in the database
-      // This handles the edge case where someone completes verification but was already in the system
-      setMessage('Checking if you are already registered...');
-      const exists = await checkExistingFaceVector(faceVector);
       
-      if (exists) {
+      // STEP 3: Check face consistency
+      setMessage('Verifying face consistency...');
+      let consistencyPassed = true;
+      
+      for (let i = 0; i < faceVectors.length - 1; i++) {
+        for (let j = i + 1; j < faceVectors.length; j++) {
+          const similarity = await calculateSimilarity(faceVectors[i], faceVectors[j]);
+          if (similarity < 0.95) {
+            consistencyPassed = false;
+            break;
+          }
+        }
+      }
+      
+      if (!consistencyPassed) {
+        throw new Error("Face verification failed: inconsistent face detections. Please try again.");
+      }
+      
+      // Use the highest quality vector (middle one to avoid extremes)
+      const middleIndex = Math.floor(faceVectors.length / 2);
+      const faceVector = faceVectors[middleIndex];
+      faceVectorRef.current = faceVector; // Store for future use
+      
+      // STEP 4: Final check if this face is already in the database
+      setMessage('Checking for existing registration...');
+      const storageResult = await storeFaceVector(faceVector);
+      
+      if (storageResult.status === 'existing') {
         console.log("Face already exists in database");
-        setMessage('Your face is already registered in our system!');
-        setVerificationSuccess(true);
-        setStepsCompleted(prev => ({ ...prev, faceStored: true }));
+        setMessage('This face is already registered in our system!');
       } else {
-        // Store the face data and complete the process
-        setMessage('Storing your face data securely...');
-        
-        try {
-          await storeFaceVector(faceVector);
-          
-          // Double-check that storage worked by verifying the face was saved
-          const storageVerified = await checkExistingFaceVector(faceVector);
-          
-          if (storageVerified) {
-            console.log("Face vector successfully stored and verified");
-            setMessage('Verification successful! Your face is now registered.');
-          } else {
-            console.warn("Storage verification warning: Face was stored but not found on verification");
-            setMessage('Verification successful! Your face is now registered.');
-          }
-          
-          setVerificationSuccess(true);
-          setStepsCompleted(prev => ({ ...prev, faceStored: true }));
-        } catch (error) {
-          console.error("Error storing face vector:", error);
-          throw new Error("Failed to save your face data. Please try again.");
-        }
+        setMessage('Face data successfully stored!');
       }
+      
+      // Final success state
+      setVerificationSuccess(true);
+      setStepsCompleted(prev => ({ ...prev, faceStored: true }));
       
       // Update verification strength to 100%
       setVerification(prev => ({
@@ -770,92 +967,81 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
       setVerificationComplete(false);
     }
   };
-  // Helper for progress bar
-  const getProgress = () => {
-    // Always show 100% when verification is complete
-    if (verificationSuccess || isAlreadyVerified || verificationComplete) {
-      return 1.0; // 100%
-    }
-    
-    // Show 75% when all verification steps are done but storage is pending
-    if (stepsCompleted.blink && stepsCompleted.turnLeft && stepsCompleted.turnRight) {
-      return 0.75; // 75%
-    }
-    
-    // Calculate based on steps completed
-    let progress = 0;
-    if (stepsCompleted.blink) progress += 0.25;
-    if (stepsCompleted.turnLeft) progress += 0.25;
-    if (stepsCompleted.turnRight) progress += 0.25;
-    if (stepsCompleted.faceStored) progress += 0.25;
-    
-    return progress;
-  };  // Monitor verification steps and trigger completion automatically if needed
-  useEffect(() => {
-    // If all verification steps are completed but storage hasn't happened
-    if (stepsCompleted.blink && stepsCompleted.turnLeft && stepsCompleted.turnRight && 
-        !stepsCompleted.faceStored && !verificationSuccess && !isAlreadyVerified) {
-      
-      console.log("All steps completed, triggering verification completion");
-      // Set as complete and trigger storing process
-      setVerificationComplete(true);
-      setVerificationStep('complete');
-      handleVerificationComplete();
-    }
-  }, [stepsCompleted, verificationSuccess, isAlreadyVerified]);
-
-  // Function to check if face exists in database
-  const checkFaceInDatabase = async (faceVectors) => {
+  // Face quality check function for reuse
+  const checkFaceDetectionQuality = (detection) => {
     try {
-      setHasCheckedDatabase(true);
-      setMessage('Checking if your face is already registered...');
-      
-      // Only use the best vectors (some might be lower quality)
-      const bestVectors = faceVectors.slice(-3); // Use the most recent 3 detections
-      let verifiedCount = 0;
-      
-      // Check each vector against the database
-      for (let i = 0; i < bestVectors.length; i++) {
-        const result = await checkExistingFaceVector(bestVectors[i]);
-        if (result) verifiedCount++;
-        
-        console.log(`Database check ${i+1}/${bestVectors.length}: ${result ? 'MATCH' : 'NO MATCH'}`);
+      // Check if we have landmarks and descriptors
+      if (!detection.landmarks || !detection.descriptor) {
+        return false;
       }
       
-      const percentMatch = (verifiedCount / bestVectors.length) * 100;
-      console.log(`Face verification result: ${verifiedCount}/${bestVectors.length} (${percentMatch.toFixed(1)}%)`);
+      const landmarks = detection.landmarks;
+      const expressions = detection.expressions || { neutral: 0.5 }; // Default if missing
+      const descriptor = detection.descriptor;
       
-      // If majority of checks confirm this is an existing user
-      if (verifiedCount >= 2) {
-        console.log('This face is already verified in the system');
-        setMessage('Face recognized! You are already verified.');
-        setIsAlreadyVerified(true);
-        setVerificationSuccess(true);
-        setVerificationComplete(true);
-        setStepsCompleted({
-          blink: true,
-          turnLeft: true,
-          turnRight: true,
-          faceStored: true
-        });
+      // Check face position (needs to be well-centered)
+      const box = detection.detection.box;
+      const videoWidth = videoRef.current.videoWidth || 640;
+      const videoHeight = videoRef.current.videoHeight || 480;
+      
+      // Face should not be too close to the edges
+      const margin = 0.1; // 10% margin
+      const isWellCentered = 
+        box.x > videoWidth * margin && 
+        box.y > videoHeight * margin &&
+        (box.x + box.width) < videoWidth * (1 - margin) &&
+        (box.y + box.height) < videoHeight * (1 - margin);
         
-        // Call the completion callback
-        if (onVerificationComplete) {
-          onVerificationComplete();
-        }
-      } else {
-        console.log('This is a new face - starting verification process');
-        setMessage('Welcome! Please complete the verification steps.');
+      // Face should be large enough but not too large
+      const faceAreaRatio = (box.width * box.height) / (videoWidth * videoHeight);
+      const isGoodSize = faceAreaRatio > 0.05 && faceAreaRatio < 0.7; // Between 5% and 70% of frame
+      
+      // Face should not have extreme expressions
+      const neutralExpression = expressions.neutral || 0;
+      const hasNeutralExpression = neutralExpression > 0.5; // At least somewhat neutral
+      
+      // Check for overall quality
+      const qualityFactors = {
+        isWellCentered,
+        isGoodSize,
+        hasNeutralExpression,
+        descriptorLength: descriptor.length === 128 // Standard face-api descriptor length
+      };
+      
+      const qualityScore = Object.values(qualityFactors).filter(v => v).length;
+      const isGoodQuality = qualityScore >= 3; // At least 3 of 4 factors must be good
+      
+      if (!isGoodQuality) {
+        console.log('Face quality check failed with factors:', qualityFactors);
       }
       
-      // Mark initial check as complete
-      setInitialDbCheckComplete(true);
-      
-    } catch (error) {
-      console.error('Error checking face in database:', error);
-      setMessage('Error during face check. Starting verification steps...');
-      setInitialDbCheckComplete(true);
+      return isGoodQuality;
+    } catch (err) {
+      console.warn('Error in face quality check:', err);
+      return false;
     }
+  };
+  
+  // Helper function to calculate progress percentage (0-1)
+  const getProgress = () => {
+    // Count completed steps
+    const completedSteps = Object.values(stepsCompleted).filter(Boolean).length;
+    const totalSteps = Object.keys(stepsCompleted).length;
+    
+    // If all steps are complete, return 1 (100%)
+    if (completedSteps === totalSteps || isAlreadyVerified || verificationSuccess) {
+      return 1;
+    }
+    
+    // Otherwise calculate partial progress
+    const baseProgress = completedSteps / totalSteps;
+    
+    // Add partial progress within the current step
+    if (verificationStep === 'blink' && verification.blinks > 0) {
+      return baseProgress + (verification.blinks / (verification.requiredBlinks * totalSteps));
+    }
+    
+    return baseProgress;
   };
 
   return (
