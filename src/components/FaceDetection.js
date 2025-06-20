@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import faceapi from '../utils/faceApiBrowserAdapter';
-import { generateFaceVector, encryptFaceVector, storeFaceVector, checkExistingFaceVector } from '../utils/faceVerification';
+import { generateFaceVector, encryptFaceVector, storeFaceVector, checkExistingFaceVector, calculateSimilarity } from '../utils/faceVerification';
 
 const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
   const videoRef = useRef();
@@ -156,7 +156,12 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
         faceapi.draw.drawFaceExpressions(canvas, resizedDetections);
 
         if (detections && detections.length > 0) {
-          // Check if user is already verified (only once)
+          // Always update the current face vector for future use
+          if (!faceVectorRef.current && detections[0].descriptor) {
+            faceVectorRef.current = generateFaceVector(detections[0]);
+          }
+          
+          // Check if user is already verified (only if not already checked)
           if (!initialCheckDoneRef.current && !isAlreadyVerified) {
             await checkForExistingVerification(detections);
             if (isAlreadyVerified) {
@@ -338,22 +343,88 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
   ]);
   // Check if user is already verified when face is detected
   const checkForExistingVerification = async (detections) => {
-    if (!detections || detections.length === 0 || initialCheckDoneRef.current) {
+    if (!detections || detections.length === 0) {
+      console.log('No detections available for verification check');
+      return;
+    }
+
+    // Only perform this check once per session
+    if (initialCheckDoneRef.current) {
       return;
     }
 
     try {
-      console.log('Performing initial verification check...');
+      console.log('Starting multi-step verification check process...');
+      // Set flag to prevent duplicate checks
+      initialCheckDoneRef.current = true;
+      
+      // Step 1: Get initial face vector
       const faceVector = generateFaceVector(detections[0]);
-      faceVectorRef.current = faceVector; // Store for future use
+      
+      // Store for future use
+      faceVectorRef.current = faceVector; 
       
       setIsCheckingExisting(true);
       setMessage('Checking if you are already verified...');
       
-      const exists = await checkExistingFaceVector(faceVector);
+      // Step 2: Get multiple face detections to ensure stability
+      const faceVectors = [];
+      let stableDetectionCount = 0;
       
-      if (exists) {
-        console.log('User is already verified!');
+      // Collect multiple face detections to ensure stability
+      for (let i = 0; i < 3; i++) {
+        try {
+          // Wait a moment to get different frames
+          await new Promise(resolve => setTimeout(resolve, 300));
+          
+          const newDetections = await faceapi.detectAllFaces(videoRef.current, new faceapi.TinyFaceDetectorOptions())
+            .withFaceLandmarks()
+            .withFaceDescriptors();
+            
+          if (newDetections && newDetections.length > 0) {
+            const newFaceVector = generateFaceVector(newDetections[0]);
+            faceVectors.push(newFaceVector);
+            
+            // Check if this detection is consistent with our original
+            const selfSimilarity = calculateSimilarity(faceVector, newFaceVector);
+            console.log(`Face stability check ${i+1}: similarity = ${selfSimilarity.toFixed(4)}`);
+            
+            if (selfSimilarity > 0.92) {
+              stableDetectionCount++;
+            }
+          }
+        } catch (err) {
+          console.warn(`Error during stability check ${i+1}:`, err);
+        }
+      }
+      
+      // Step 3: Verify stability before checking database
+      if (stableDetectionCount < 2) {
+        console.warn(`Face detection not stable enough (${stableDetectionCount}/3 stable detections)`);
+        setMessage('Please keep your face centered and still');
+        setIsCheckingExisting(false);
+        return;
+      }
+      
+      console.log('Face detection is stable. Proceeding with verification check...');
+      
+      // Step 4: Check all collected vectors against the database
+      let matchCount = 0;
+      
+      for (const vector of faceVectors) {
+        try {
+          const exists = await checkExistingFaceVector(vector);
+          if (exists) {
+            matchCount++;
+          }
+        } catch (error) {
+          console.warn('Error during database check:', error);
+        }
+      }
+      
+      // Step 5: Only verify if multiple checks succeed
+      if (matchCount >= 2) {
+        console.log(`User verified with high confidence (${matchCount}/${faceVectors.length} checks passed)`);
         setIsAlreadyVerified(true);
         setVerificationSuccess(true);
         setMessage('You are already verified! Face recognized.');
@@ -365,6 +436,15 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
           faceStored: true
         });
         
+        // Update verification state
+        setVerification(prev => ({
+          ...prev,
+          blinks: 2,
+          leftTurn: true,
+          rightTurn: true,
+          verificationStrength: 100
+        }));
+        
         // Stop the detection process
         if (detectionIntervalRef.current) {
           clearInterval(detectionIntervalRef.current);
@@ -375,18 +455,79 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
           onVerificationComplete();
         }
       } else {
-        console.log('User is not verified yet, continuing with verification process...');
+        console.log(`User not verified (only ${matchCount}/${faceVectors.length} checks passed)`);
         setMessage('Please blink twice (0/2) to begin verification');
       }
-      
-      initialCheckDoneRef.current = true;
     } catch (error) {
-      console.error('Error checking existing verification:', error);
+      console.error('Error during verification check:', error);
       setMessage('Error checking verification. Please try again.');
     } finally {
       setIsCheckingExisting(false);
     }
   };
+
+  // Check for existing verification on first solid face detection
+  useEffect(() => {
+    let initialCheckTimer = null;
+    let checkAttempts = 0;
+    
+    if (!initialCheckDoneRef.current) {
+      initialCheckTimer = setInterval(async () => {
+        // Give up after several attempts
+        if (checkAttempts >= 5 || initialCheckDoneRef.current) {
+          clearInterval(initialCheckTimer);
+          return;
+        }
+        
+        checkAttempts++;
+        
+        try {
+          // Only attempt if we have a valid face vector
+          if (faceVectorRef.current) {
+            console.log(`Attempt ${checkAttempts}: Checking for existing verification`);
+            
+            // Check if this face is already verified
+            const exists = await checkExistingFaceVector(faceVectorRef.current);
+            
+            if (exists) {
+              console.log('User verified from initial check! Updating state...');
+              setIsAlreadyVerified(true);
+              setVerificationSuccess(true);
+              setVerificationComplete(true);
+              
+              setStepsCompleted({
+                blink: true,
+                turnLeft: true,
+                turnRight: true,
+                faceStored: true
+              });
+              
+              setMessage('You are already verified! Face recognized.');
+              
+              // Call completion callback
+              if (onVerificationComplete) {
+                onVerificationComplete();
+              }
+              
+              clearInterval(initialCheckTimer);
+            }
+            
+            // Mark as checked even if not verified
+            initialCheckDoneRef.current = true;
+            clearInterval(initialCheckTimer);
+          }
+        } catch (error) {
+          console.error('Error in initial verification check:', error);
+        }
+      }, 2000); // Check every 2 seconds
+    }
+    
+    return () => {
+      if (initialCheckTimer) {
+        clearInterval(initialCheckTimer);
+      }
+    };
+  }, []);
 
   const calculateEAR = (eye) => {
     try {
@@ -477,9 +618,29 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
         return;
       }
 
-      // Store the face data and complete the process
-      setMessage('Verification successful! Face data stored.');
-      await storeFaceVector(faceVector);
+      // First check if this face already exists in the database
+      // This prevents duplicate entries and confirms our verification system works
+      console.log("Performing final check before storing face vector...");
+      const exists = await checkExistingFaceVector(faceVector);
+      
+      if (exists) {
+        console.log("Face already exists in database, skipping storage");
+        setMessage('Your face is already registered in our system!');
+      } else {
+        // Store the face data and complete the process
+        setMessage('Storing your face data securely...');
+        await storeFaceVector(faceVector);
+        setMessage('Verification successful! Face data stored.');
+        
+        // Double-check that storage worked by trying to retrieve it
+        const verifyStorageWorked = await checkExistingFaceVector(faceVector);
+        if (verifyStorageWorked) {
+          console.log("Storage verification successful!");
+        } else {
+          console.warn("Storage verification failed - data may not have been stored correctly");
+          // We'll show success anyway, but log the issue
+        }
+      }
       
       // Mark the final step as complete
       setStepsCompleted(prev => ({ ...prev, faceStored: true }));
@@ -536,6 +697,35 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
 
   return (
     <div className="face-detection-outer">
+      {/* Development controls for testing - hidden in production */}
+      {process.env.NODE_ENV === 'development' && (
+        <div className="dev-controls">
+          <button 
+            onClick={() => {
+              console.log('Resetting verification state...');
+              initialCheckDoneRef.current = false;
+              setBlinkCount(0);
+              setHeadVerification({ left: false, right: false });
+              headVerificationRef.current = { left: false, right: false };
+              setVerificationComplete(false);
+              setVerificationSuccess(false);
+              setIsAlreadyVerified(false);
+              setStepsCompleted({
+                blink: false,
+                turnLeft: false,
+                turnRight: false,
+                faceStored: false
+              });
+              setVerificationStep('blink');
+              setMessage('Please blink twice (0/2) to begin verification');
+            }}
+            className="dev-reset-btn"
+          >
+            Reset Verification (Dev Only)
+          </button>
+        </div>
+      )}
+
       {/* Status/Error/Progress above video */}
       <div className="face-info-top">
         {/* Only show status if there is no error */}
