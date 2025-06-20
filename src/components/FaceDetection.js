@@ -93,7 +93,15 @@ const FaceDetection = ({ walletAddress, onVerificationComplete }) => {
       })
       .catch(err => {
         console.error('Error accessing webcam:', err);
-        setVerificationError('Error accessing webcam. Please ensure you have granted camera permissions.');
+        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+          setVerificationError('Camera access was denied. Please allow camera permissions in your browser settings and reload the page. If you are on mobile, close any overlays or bubbles from other apps and try again.');
+        } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+          setVerificationError('No camera device found. Please connect a camera and try again.');
+        } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+          setVerificationError('Camera is already in use by another application. Please close other apps that might be using the camera and try again.');
+        } else {
+          setVerificationError('Error accessing webcam. Please ensure you have granted camera permissions and no other apps are using the camera.');
+        }
       });
   };
 
