@@ -186,7 +186,8 @@ export const storeFaceVector = async (faceVector) => {
 
     // ULTRA-STRICT duplicate check before storing
     console.log('Running ultra-strict duplicate check before storing...');
-      // Step 1: Use our regular check first
+    
+    // Step 1: Use our regular check first
     const existingCheck = await checkExistingFaceVector(faceVector);
     
     if (existingCheck) {
